@@ -21,6 +21,10 @@ import io.kestra.core.utils.ListUtils;
 import io.kestra.plugin.ai.AIUtils;
 import io.kestra.plugin.ai.domain.*;
 import io.kestra.plugin.ai.domain.ChatMessage;
+import io.kestra.plugin.ai.provider.AzureOpenAI;
+import io.kestra.plugin.ai.provider.LocalAI;
+import io.kestra.plugin.ai.provider.OpenAICompliantProvider;
+import io.kestra.plugin.ai.provider.OpenRouter;
 import io.kestra.plugin.ai.provider.TimingChatModelListener;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.annotation.Nullable;
@@ -29,6 +33,13 @@ import lombok.*;
 import lombok.experimental.SuperBuilder;
 import org.slf4j.Logger;
 
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URLConnection;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 
@@ -40,7 +51,7 @@ import static io.kestra.plugin.ai.domain.ChatMessageType.*;
 @Getter
 @NoArgsConstructor
 @Schema(
-    title = "Run chat completion with tools",
+    title = "Run chat completion",
     description = """
         Executes a chat turn from a message list (max one system message; last must be USER) using the configured provider. Optional tools may be invoked by the model; token metrics are reported. JSON-schema formats in `configuration` require provider support."""
 )
@@ -70,6 +81,30 @@ import static io.kestra.plugin.ai.domain.ChatMessageType.*;
                         content: You are a helpful assistant, answer concisely, avoid overly casual language or unnecessary verbosity.
                       - type: USER
                         content: "{{inputs.prompt}}"
+                """
+            }
+        ),
+        @Example(
+            title = "Chat completion with mixed text and PDF contents",
+            full = true,
+            code = {
+                """
+                id: chat_completion_with_pdf
+                namespace: company.ai
+
+                tasks:
+                  - id: chat_completion
+                    type: io.kestra.plugin.ai.completion.ChatCompletion
+                    provider:
+                      type: io.kestra.plugin.ai.provider.OpenAI
+                      apiKey: "{{ secret('OPENAI_API_KEY') }}"
+                      modelName: gpt-5-mini
+                    messages:
+                      - type: USER
+                        contents:
+                          - text: Summarize this file.
+                          - type: PDF
+                            uri: "{{ outputs.download.uri }}"
                 """
             }
         ),
@@ -165,6 +200,10 @@ import static io.kestra.plugin.ai.domain.ChatMessageType.*;
     aliases = {"io.kestra.plugin.langchain4j.ChatCompletion", "io.kestra.plugin.langchain4j.completion.ChatCompletion"}
 )
 public class ChatCompletion extends Task implements RunnableTask<ChatCompletion.Output> {
+    private static final long MAX_ATTACHMENT_SIZE_BYTES = 20L * 1024L * 1024L;
+    private static final int MAX_USER_PDF_BLOCKS = 5;
+    private static final int MAX_USER_IMAGE_BLOCKS = 20;
+    private static final String PDF_MIME_TYPE = "application/pdf";
 
     @Schema(
         title = "Chat Messages",
@@ -194,7 +233,7 @@ public class ChatCompletion extends Task implements RunnableTask<ChatCompletion.
 
         // Render existing messages
         List<ChatMessage> renderedChatMessagesInput = runContext.render(messages).asList(ChatMessage.class);
-        List<dev.langchain4j.data.message.ChatMessage> chatMessages = convertMessages(renderedChatMessagesInput);
+        List<dev.langchain4j.data.message.ChatMessage> chatMessages = convertMessages(runContext, renderedChatMessagesInput);
 
         long nbSystemMessages = chatMessages.stream().filter(msg -> msg.type() == dev.langchain4j.data.message.ChatMessageType.SYSTEM).count();
         if (nbSystemMessages > 1) {
@@ -240,7 +279,7 @@ public class ChatCompletion extends Task implements RunnableTask<ChatCompletion.
                     throw new ToolExecutionException(error);
                 })
                 .build();
-            Result<AiMessage> aiResponse = assistant.chat(((UserMessage)chatMessages.getLast()).singleText());
+            Result<AiMessage> aiResponse = assistant.chat(((UserMessage) chatMessages.getLast()).contents());
             logger.debug("AI Response: {}", aiResponse.content());
 
             // send metrics for token usage
@@ -270,17 +309,203 @@ public class ChatCompletion extends Task implements RunnableTask<ChatCompletion.
     }
 
     interface Assistant {
-        Result<AiMessage> chat(@dev.langchain4j.service.UserMessage String chatMessage);
+        Result<AiMessage> chat(List<Content> chatMessage);
     }
 
-    private List<dev.langchain4j.data.message.ChatMessage> convertMessages(List<ChatMessage> messages) {
-        return messages.stream()
-            .map(dto -> switch (dto.type()) {
-                case SYSTEM -> SystemMessage.systemMessage(dto.content());
-                case AI ->  AiMessage.aiMessage(dto.content());
-                case USER ->  UserMessage.userMessage(dto.content());
-            })
-            .toList();
+    List<dev.langchain4j.data.message.ChatMessage> convertMessages(RunContext runContext, List<ChatMessage> messages) throws Exception {
+        List<dev.langchain4j.data.message.ChatMessage> converted = new ArrayList<>(messages.size());
+        for (ChatMessage message : messages) {
+            converted.add(switch (message.type()) {
+                case SYSTEM -> SystemMessage.systemMessage(resolveTextOnlyMessage(message));
+                case AI -> AiMessage.aiMessage(resolveTextOnlyMessage(message));
+                case USER -> toUserMessage(runContext, message);
+            });
+        }
+        return converted;
+    }
+
+    private String resolveTextOnlyMessage(ChatMessage message) {
+        List<ChatMessage.ContentBlock> contents = resolveContents(message);
+        StringBuilder builder = new StringBuilder();
+
+        for (ChatMessage.ContentBlock block : contents) {
+            if (block.effectiveType() != ChatMessage.ContentBlock.Type.TEXT) {
+                throw new IllegalArgumentException("Only TEXT content blocks are supported for " + message.type() + " messages.");
+            }
+            if (block.text() == null || block.text().isBlank()) {
+                throw new IllegalArgumentException("TEXT content blocks require a non-empty `text` field.");
+            }
+            if (!builder.isEmpty()) {
+                builder.append('\n');
+            }
+            builder.append(block.text());
+        }
+
+        if (builder.isEmpty()) {
+            throw new IllegalArgumentException("Message type " + message.type() + " requires non-empty text content.");
+        }
+        return builder.toString();
+    }
+
+    private UserMessage toUserMessage(RunContext runContext, ChatMessage message) throws Exception {
+        List<ChatMessage.ContentBlock> blocks = resolveContents(message);
+        List<Content> contents = new ArrayList<>(blocks.size());
+
+        int pdfCount = 0;
+        int imageCount = 0;
+
+        for (ChatMessage.ContentBlock block : blocks) {
+            switch (block.effectiveType()) {
+                case TEXT -> contents.add(toTextContent(block));
+                case PDF -> {
+                    pdfCount++;
+                    if (pdfCount > MAX_USER_PDF_BLOCKS) {
+                        throw new IllegalArgumentException("A user message can contain at most " + MAX_USER_PDF_BLOCKS + " PDF content blocks.");
+                    }
+                    contents.add(toPdfContent(runContext, block));
+                }
+                case IMAGE -> {
+                    imageCount++;
+                    if (imageCount > MAX_USER_IMAGE_BLOCKS) {
+                        throw new IllegalArgumentException("A user message can contain at most " + MAX_USER_IMAGE_BLOCKS + " image content blocks.");
+                    }
+                    contents.add(toImageContent(runContext, block));
+                }
+            }
+        }
+
+        if (contents.isEmpty()) {
+            throw new IllegalArgumentException("USER messages require at least one content block.");
+        }
+
+        boolean hasNonTextContent = contents.stream().anyMatch(content -> content.type() != ContentType.TEXT);
+        if (hasNonTextContent && !supportsMultimodalInput()) {
+            String providerName = provider == null ? "null" : provider.getClass().getSimpleName();
+            throw new IllegalArgumentException("Provider `" + providerName + "` does not support IMAGE/PDF chat contents. Supported providers: OpenAI-compatible, AzureOpenAI, OpenRouter, LocalAI.");
+        }
+
+        return UserMessage.userMessage(contents);
+    }
+
+    private TextContent toTextContent(ChatMessage.ContentBlock block) {
+        if (block.text() == null || block.text().isBlank()) {
+            throw new IllegalArgumentException("TEXT content blocks require a non-empty `text` field.");
+        }
+        return TextContent.from(block.text());
+    }
+
+    private ImageContent toImageContent(RunContext runContext, ChatMessage.ContentBlock block) throws Exception {
+        boolean hasUri = block.uri() != null && !block.uri().isBlank();
+        boolean hasBase64 = block.base64() != null && !block.base64().isBlank();
+
+        if (hasBase64) {
+            throw new IllegalArgumentException("IMAGE content blocks support only Kestra file URIs. Remove `base64` and provide `uri` from a FILE input.");
+        }
+        if (!hasUri) {
+            throw new IllegalArgumentException("IMAGE content blocks require `uri` pointing to a Kestra uploaded file.");
+        }
+
+        URI uri = parseUri(block.uri(), "IMAGE");
+        ResolvedFile resolvedFile = resolveKestraFile(runContext, uri, "IMAGE");
+
+        validateAttachmentSize(resolvedFile.bytes().length, "IMAGE");
+        String mediaType = resolveImageMediaType(null, null, resolvedFile.bytes());
+        return ImageContent.from(Base64.getEncoder().encodeToString(resolvedFile.bytes()), mediaType);
+    }
+
+    private PdfFileContent toPdfContent(RunContext runContext, ChatMessage.ContentBlock block) throws Exception {
+        boolean hasUri = block.uri() != null && !block.uri().isBlank();
+        boolean hasBase64 = block.base64() != null && !block.base64().isBlank();
+
+        if (hasBase64) {
+            throw new IllegalArgumentException("PDF content blocks support only Kestra file URIs. Remove `base64` and provide `uri` from a FILE input.");
+        }
+        if (!hasUri) {
+            throw new IllegalArgumentException("PDF content blocks require `uri` pointing to a Kestra uploaded file.");
+        }
+
+        URI uri = parseUri(block.uri(), "PDF");
+        ResolvedFile resolvedFile = resolveKestraFile(runContext, uri, "PDF");
+        validateAttachmentSize(resolvedFile.bytes().length, "PDF");
+        validatePdfBytes(resolvedFile.bytes(), resolvedFile.sourceDescription());
+        return PdfFileContent.from(Base64.getEncoder().encodeToString(resolvedFile.bytes()), PDF_MIME_TYPE);
+    }
+
+    private URI parseUri(String raw, String blockType) {
+        try {
+            return URI.create(raw);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid " + blockType + " uri: `" + raw + "`", e);
+        }
+    }
+
+    private List<ChatMessage.ContentBlock> resolveContents(ChatMessage message) {
+        List<ChatMessage.ContentBlock> contents = message.effectiveContents();
+        if (contents.isEmpty()) {
+            throw new IllegalArgumentException("Message type " + message.type() + " must define either `content` (legacy) or `contents`.");
+        }
+        return contents;
+    }
+
+    private ResolvedFile resolveKestraFile(RunContext runContext, URI uri, String blockType) throws Exception {
+        String scheme = uri.getScheme();
+        if (!"kestra".equalsIgnoreCase(scheme)) {
+            throw new IllegalArgumentException(blockType + " content supports only Kestra uploaded files (`kestra://...`).");
+        }
+        try (InputStream inputStream = runContext.storage().getFile(uri)) {
+            return new ResolvedFile(inputStream.readAllBytes(), "storage uri `" + uri + "`");
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Unable to read " + blockType + " file from Kestra storage uri `" + uri + "`.", e);
+        }
+    }
+
+    private String resolveImageMediaType(String explicitMediaType, String dataUrlMediaType, byte[] bytes) throws Exception {
+        String mediaType = explicitMediaType;
+        if (mediaType == null || mediaType.isBlank()) {
+            mediaType = dataUrlMediaType;
+        }
+
+        if (mediaType == null || mediaType.isBlank()) {
+            try (ByteArrayInputStream stream = new ByteArrayInputStream(bytes)) {
+                mediaType = URLConnection.guessContentTypeFromStream(stream);
+            }
+        }
+
+        if (mediaType == null || mediaType.isBlank()) {
+            throw new IllegalArgumentException("Unable to detect IMAGE media type. Please set `mediaType` explicitly.");
+        }
+        if (!mediaType.startsWith("image/")) {
+            throw new IllegalArgumentException("Invalid IMAGE media type `" + mediaType + "`. It must start with `image/`.");
+        }
+        return mediaType;
+    }
+
+    private void validatePdfBytes(byte[] bytes, String sourceDescription) {
+        byte[] signature = "%PDF-".getBytes(StandardCharsets.US_ASCII);
+        if (bytes.length < signature.length) {
+            throw new IllegalArgumentException("Invalid PDF content from " + sourceDescription + ": file is too small.");
+        }
+        for (int i = 0; i < signature.length; i++) {
+            if (bytes[i] != signature[i]) {
+                throw new IllegalArgumentException("Invalid PDF content from " + sourceDescription + ": the content is not a PDF file.");
+            }
+        }
+    }
+
+    private void validateAttachmentSize(long sizeInBytes, String blockType) {
+        if (sizeInBytes > MAX_ATTACHMENT_SIZE_BYTES) {
+            throw new IllegalArgumentException(blockType + " content exceeds max size of " + MAX_ATTACHMENT_SIZE_BYTES + " bytes.");
+        }
+    }
+
+    private boolean supportsMultimodalInput() {
+        return provider instanceof OpenAICompliantProvider
+            || provider instanceof AzureOpenAI
+            || provider instanceof OpenRouter
+            || provider instanceof LocalAI;
+    }
+
+    private record ResolvedFile(byte[] bytes, String sourceDescription) {
     }
 
     @Override

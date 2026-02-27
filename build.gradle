@@ -58,7 +58,7 @@ dependencies {
     compileOnly 'com.github.docker-java:docker-java-transport-httpclient5'
 
     // Langchain4j model providers
-    implementation "dev.langchain4j:langchain4j"
+    implementation "dev.langchain4j:langchain4j:1.11.0"
     implementation "dev.langchain4j:langchain4j-anthropic"
     implementation "dev.langchain4j:langchain4j-azure-open-ai"
     implementation "dev.langchain4j:langchain4j-bedrock"
@@ -66,7 +66,7 @@ dependencies {
     implementation "dev.langchain4j:langchain4j-google-ai-gemini"
     implementation "dev.langchain4j:langchain4j-mistral-ai"
     implementation "dev.langchain4j:langchain4j-ollama"
-    implementation "dev.langchain4j:langchain4j-open-ai"
+    implementation "dev.langchain4j:langchain4j-open-ai:1.11.0"
     implementation "dev.langchain4j:langchain4j-vertex-ai"
     implementation "dev.langchain4j:langchain4j-vertex-ai-gemini"
     implementation 'dev.langchain4j:langchain4j-workers-ai'
